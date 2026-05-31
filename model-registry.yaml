@@ -1,0 +1,67 @@
+registry:
+  name: northstar-models
+  stages:
+    - name: staging
+      promoted_from: successful training pipeline run (eval gates all green)
+      promotion_rule: automatic
+      gates:
+        # ETA model gates
+        - "RMSE on frozen 30-day holdout set <= 4.2 minutes"
+        - "Per-city RMSE <= 6.0 minutes on the 5 lowest-performing cities in the holdout set"
+        - "p95 inference latency <= 120 ms on the standard 1000-request benchmark payload (Triton, 4 CPU cores)"
+        - "No training-serving skew: PSI < 0.15 on all top-10 features between training distribution and last 7 days of live traffic"
+        - "Model artifact size <= 150 MB (ONNX)"
+        # Dispatcher routing model gates
+        # (same staging pipeline; gates parameterised per model — see models section)
+
+    - name: production
+      promoted_from: staging
+      promotion_rule: manual
+      gates:
+        - "Canary rollout: 1% of live traffic for 24 hours with p95 latency <= 150 ms (SLA headroom)"
+        - "ETA RMSE on canary traffic within +5% of current Production champion's RMSE over the same 24 h window"
+        - "Zero error-budget burns: HTTP 5xx rate < 0.1% during canary window"
+        - "Per-city RMSE for bottom 3 cities by volume stays within +8% of champion on canary slice"
+      approvers:
+        - ml-lead         # owns model quality sign-off
+        - sre-oncall      # owns latency and reliability sign-off
+
+    - name: archived
+      promoted_from: production
+      # Triggered automatically when a newer version is promoted to Production.
+      # Also triggered manually by ml-lead when a version is recalled for safety reasons.
+      promotion_rule: automatic (on Production supersession) or manual (safety recall)
+
+models:
+  - name: eta
+    owner: ml-team
+    sla_p95_ms: 150
+    retention_versions: 10
+    retrain_cadence: every 2 weeks
+    staging_gates_override:
+      rmse_holdout_minutes: 4.2
+      rmse_per_city_bottom5_minutes: 6.0
+      latency_p95_benchmark_ms: 120
+      psi_threshold: 0.15
+      max_artifact_size_mb: 150
+
+  - name: dispatcher-routing
+    owner: ml-team
+    sla_p95_ms: 80
+    retention_versions: 10
+    retrain_cadence: monthly
+    staging_gates_override:
+      macro_f1_holdout: 0.84
+      per_city_f1_bottom3: 0.72
+      latency_p95_benchmark_ms: 60       # tighter — 80 ms SLA leaves less headroom
+      psi_threshold: 0.15
+      max_artifact_size_mb: 200
+
+lineage:
+  required_fields:
+    - git_sha              # exact commit of training code
+    - dataset_hash         # sha256 of the DVC-tracked training dataset snapshot
+    - feature_set_version  # Feast feature-set tag (e.g. eta-features@v47)
+    - training_run_id      # MLflow run ID — links to params, metrics, artifacts
+    - base_image_digest    # Docker image SHA used for the training job
+    - framework_versions   # pip-freeze snapshot pinned in requirements.lock
